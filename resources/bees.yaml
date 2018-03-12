@@ -1,0 +1,354 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  Create a Bees With Machine Guns controller;
+  execute a stress test against the target group and store the
+  results in S3. Run /home/ec2-user/run-bees to execute load tests manually.
+Parameters:
+  KeyName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the instances
+    Type: AWS::EC2::KeyPair::KeyName
+  BeesControllerInstanceType:
+    Description: Type of EC2 instance to launch for the controller
+    Type: String
+    Default: t2.medium
+    AllowedValues:
+      - t2.micro
+      - t2.small
+      - t2.medium
+      - t2.large
+      - t2.xlarge
+      - t2.2xlarge
+      - m4.large
+      - c4.large
+    ConstraintDescription: Must be a valid EC2 instance type.
+  TotalConnections:
+    Description: Total connections per load tester
+    Type: Number
+    Default: 200000
+  ConcurrentConnections:
+    Description: Number of concurrent requests per load tester
+    Type: Number
+    Default: 1000
+  BeeCount:
+    Description: Number of EC2 instances to launch as the load generators (bees)
+    Type: Number
+    Default: 2
+  Target2Sting:
+    Description: The domain or hostname to send the bees to attack
+    Type: String
+    Default: http://localhost/
+  RunTests:
+    Description: >-
+      Enter 'true' to run tests immediately. WARNING: Stack will not enter
+      CREATE_COMPLETE state until test executes if this is set to 'true'.
+    Type: String
+    Default: true
+    AllowedValues:
+      - true
+      - false
+    ConstraintDescription: Must be 'true' or 'false'.
+Mappings:
+  # PV Images!!!!! No idea what the Bee AMI has on it, but I don't think it's needed.
+  # No it's not; only one AMI required.
+  RegionMap:
+    us-east-1:
+      amzn: ami-97785bed
+    us-west-1:
+      amzn: ami-824c4ee2
+    ap-northeast-2:
+      amzn: ami-863090e8
+    ap-northeast-1:
+      amzn: ami-ceafcba8
+    sa-east-1:
+      amzn: ami-84175ae8
+    ap-southeast-1:
+      amzn: ami-68097514
+    ca-central-1:
+      amzn: ami-a954d1cd
+    ap-southeast-2:
+      amzn: ami-942dd1f6
+    us-west-2:
+      amzn: ami-f2d3638a
+    us-east-2:
+      amzn: ami-f63b1193
+    ap-south-1:
+      amzn: ami-531a4c3c
+    eu-central-1:
+      amzn: ami-5652ce39
+    eu-west-1:
+      amzn: ami-d834aba1
+    eu-west-2:
+      amzn: ami-403e2524
+    eu-west-3:
+      amzn: ami-8ee056f3
+Resources:
+  CfnBeesUser:
+  #need this for the bees - boto2 not boto3.
+  # Can't figure out how to get boto2 to use InstanceProfile.
+    Type: AWS::IAM::User
+    Properties:
+      Path: /
+      Policies:
+        - PolicyName: bees-boto-user
+          PolicyDocument:
+            Statement:
+              -
+                Effect: Allow
+                Action: "ec2:*"
+                Resource: '*'
+              -
+                Effect: Allow
+                Action: "s3:*"
+                Resource: '*'
+  CfnBeesKeys: #AK/SK for Bees IAM User
+    Type: AWS::IAM::AccessKey
+    Properties:
+      UserName:
+        Ref: CfnBeesUser
+  ResultBucket: #Argument for making this a parameter, pointing at an existing bucket?
+    Type: AWS::S3::Bucket
+    Properties:
+      AccessControl: Private
+    DeletionPolicy: Retain
+  BeesProfile: #InstanceProfile for BeesController
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - Ref: BeesRole
+  BeesRole: #Role for BeesController
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        -
+          PolicyName: ec2-and-s3-access
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              -
+                Sid: ec2access
+                Effect: Allow
+                Action: "ec2:*"
+                Resource: "*"
+              -
+                Sid: s3objects
+                Effect: Allow
+                Action: "s3:*"
+                Resource:
+                  Fn::Sub:
+                    - "${bucketarn}/*"
+                    - {bucketarn: !GetAtt ResultBucket.Arn}
+  BeeController:
+    Type: AWS::EC2::Instance
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          packages:
+            python:
+              boto3: []
+              beeswithmachineguns: []
+          files:
+            /home/ec2-user/create-keypair:
+              content:
+                !Sub |
+                  #!/usr/bin/python
+                  import string
+                  import random
+                  import boto3
+                  kp_name = ''.join(random.choice(string.letters) for i in xrange(16))
+                  ec2 = boto3.client('ec2', region_name= '${AWS::Region}')
+                  response = ec2.create_key_pair(KeyName=kp_name)
+                  with open('/home/ec2-user/.ssh/%s.pem' % kp_name, "w") as kp_file:
+                    kp_file.write(response['KeyMaterial'])
+                  with file('/home/ec2-user/bees_keypair.txt', 'w') as f:
+                    f.write(kp_name)
+                    print 'Created keypair: %s' % kp_name
+              mode: '000750'
+              owner: ec2-user
+              group: ec2-user
+            /home/ec2-user/delete-keypair:
+              content:
+                !Sub |
+                  #!/usr/bin/python
+                  import string
+                  import random
+                  import boto3
+                  import os
+                  import sys
+                  if not os.path.exists('/home/ec2-user/bees_keypair.txt'):
+                    print >> sys.stderr, 'bees_keypair.txt does not exist'
+                    sys.exit(-1)
+                  with file('/home/ec2-user/bees_keypair.txt', 'r') as f:
+                    kp_name = f.read().strip()
+                  ec2 = boto3.client('ec2', region_name= '${AWS::Region}')
+                  ec2.delete_key_pair(KeyName=kp_name)
+                  os.remove('/home/ec2-user/bees_keypair.txt')
+                  os.remove('/home/ec2-user/.ssh/%s.pem' % kp_name)
+                  print 'Deleted keypair: %s' % kp_name
+              mode: '000750'
+              owner: ec2-user
+              group: ec2-user
+            /home/ec2-user/create-swarm: #be nice to be able to pass in a Bid Price param..
+              content:
+                !Sub
+                  - |
+                    #!/bin/bash
+                    /usr/local/bin/bees up -k `cat /home/ec2-user/bees_keypair.txt` \
+                      -s ${BeeCount} -z ${azone} -g ${BeeSecurityGroup} \
+                      --instance ${ami} --login ec2-user
+                  - { azone: !Select [ "0", !GetAZs ""], ami: !FindInMap ['RegionMap', !Ref "AWS::Region", "amzn"] }
+              mode: '000755'
+              owner: ec2-user
+              group: ec2-user
+            /home/ec2-user/start-swarm:
+              content:
+                !Sub |
+                  #!/bin/bash
+                  /usr/local/bin/bees attack \
+                    --url ${Target2Sting} \
+                    -n ${TotalConnections} \
+                    --concurrent ${ConcurrentConnections}
+              mode: '000755'
+              owner: ec2-user
+              group: ec2-user
+            /home/ec2-user/kill-swarm:
+              content: |
+                #!/bin/bash
+                /usr/local/bin/bees down
+              mode: '000755'
+              owner: ec2-user
+              group: ec2-user
+            /home/ec2-user/.boto: #required for boto2-based Bees.
+              content:
+                !Sub
+                  - |
+                    [Credentials]
+                    aws_access_key_id = ${CfnBeesKeys}
+                    aws_secret_access_key = ${secret}
+                    [Boto]
+                    ec2_region_name = ${AWS::Region}
+                    ec2_region_endpoint = ec2.${AWS::Region}.amazonaws.com
+                  - {secret: !GetAtt CfnBeesKeys.SecretAccessKey}
+              mode: '000600'
+              owner: ec2-user
+              group: ec2-user
+            # /home/ec2-user/.aws/credentials:
+            #   content:
+            #     !Sub
+            #       - |
+            #         [default]
+            #         aws_access_key_id = ${CfnBeesKeys}
+            #         aws_secret_access_key = ${secret}
+            #       - {secret: !GetAtt CfnBeesKeys.SecretAccessKey}
+            #   mode: '000600'
+            #   owner: ec2-user
+            #   group: ec2-user
+            # /home/ec2-user/.aws/config:
+            #   content:
+            #     !Sub |
+            #       [default]
+            #       region = ${AWS::Region}
+            #   mode: '000600'
+            #   owner: ec2-user
+            #   group: ec2-user
+            /home/ec2-user/run-bees:
+              content:
+                !Sub |
+                  #!/bin/bash
+                  mkdir /home/ec2-user/swarm-results
+                  chmod 777 ./swarm-results/
+                  /home/ec2-user/create-keypair > /home/ec2-user/swarm-results/create-keypair.log 2>&1
+                  bash /home/ec2-user/create-swarm > /home/ec2-user/swarm-results/create-swarm.log 2>&1
+                  sleep 45 # Allow EC2 instances to fully come up
+                  bash /home/ec2-user/start-swarm > /home/ec2-user/swarm-results/start-swarm.log 2>&1
+                  bash /home/ec2-user/kill-swarm > /home/ec2-user/swarm-results/kill-swarm.log 2>&1
+                  /home/ec2-user/delete-keypair > /home/ec2-user/swarm-results/delete-keypair.log 2>&1
+                  tar cvf /home/ec2-user/swarm-results.tar.gz /home/ec2-user/swarm-results/*
+                  chown ec2-user:ec2-user -R /home/ec2-user/swarm-results
+                  chown ec2-user:ec2-user /home/ec2-user/swarm-results.tar.gz
+                  aws s3 cp /home/ec2-user/swarm-results.tar.gz s3://${ResultBucket}/swarm-results.tar.gz
+              mode: '000755'
+              owner: ec2-user
+              group: ec2-user
+          commands:
+            01run_bees:
+              command: "su ec2-user -c ./run-bees"
+              cwd: /home/ec2-user
+              test:
+                !Sub
+                  "test 'true' = ${RunTests}"
+    Properties:
+      IamInstanceProfile: !Ref BeesProfile
+      SecurityGroups:
+        - !Ref ControllerSecurityGroup
+      KeyName:
+        !Ref KeyName
+      ImageId:
+        !FindInMap [ RegionMap, !Ref "AWS::Region", amzn ]
+      InstanceType:
+        Ref: BeesControllerInstanceType
+      Tags:
+        - Key: Name
+          Value: bees-controller
+      UserData:
+        !Base64
+          Fn::Sub: |
+            #!/bin/bash
+            yum update -y
+            yum update -y aws-cfn-bootstrap
+            /opt/aws/bin/cfn-init -v -s ${AWS::StackName} \
+              -r BeeController --region ${AWS::Region}
+            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} \
+              --resource BeeController --region ${AWS::Region}
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT15M
+  ControllerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable SSH access
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+  BeeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable SSH access and HTTP access on the inbound port
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          SourceSecurityGroupName:
+            Ref: ControllerSecurityGroup
+Outputs:
+  WebsiteURL:
+    Description: URL of website under test
+    Value:
+      Ref: Target2Sting
+  BeeControllerAddress:
+    Description: Public address of the bees controller
+    Value:
+      !GetAtt BeeController.PublicDnsName
+  TestResultsURL:
+    Value:
+      !Sub |
+        http://${ResultBucket.DomainName}/swarm-results.tar.gz
+    Description: URL of Results file
+  DownloadTestResultsCLICommand:
+    Value:
+      !Sub |
+        aws s3 cp . s3://${ResultBucket.DomainName}/swarm-results.tar.gz
+    Description: Command Line to download results

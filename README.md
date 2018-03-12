@@ -2,6 +2,8 @@
 
 This cloudformation template launches a "Bees with Machine Guns" (see https://github.com/newsapps/beeswithmachineguns) cluster of load generators into AWS which hit single URL and generate load on a website.
 
+Cloned from https://github.com/huit/bees-with-machine-guns and then converted to YAML format.
+
 To launch, edit the launch script `bin/attack.sh` with the details of your AWS account and environment. Once ready, launch from the command ala
 
 ```
